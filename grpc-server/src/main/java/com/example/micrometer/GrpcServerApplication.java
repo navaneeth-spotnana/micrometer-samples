@@ -19,6 +19,8 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Hooks;
 
 @SpringBootApplication
 public class GrpcServerApplication {
@@ -29,6 +31,7 @@ public class GrpcServerApplication {
     int port;
 
     public static void main(String... args) {
+        Hooks.enableAutomaticContextPropagation();
         new SpringApplicationBuilder(GrpcServerApplication.class).web(WebApplicationType.NONE).run(args);
     }
 
@@ -63,6 +66,11 @@ public class GrpcServerApplication {
         return server::shutdownNow;
     }
 
+    @Bean
+    WebClient webClient(WebClient.Builder builder, @Value("${url:https://reqres.in/}") String url) {
+        return builder.baseUrl(url).build();
+    }
+
     // gRPC service extending SimpleService and provides echo implementation.
     @Service
     static class EchoService extends SimpleServiceImplBase {
@@ -71,8 +79,11 @@ public class GrpcServerApplication {
 
         private final Tracer tracer;
 
-        public EchoService(Tracer tracer) {
+        private final WebClient webClient;
+
+        public EchoService(Tracer tracer, WebClient webClient) {
             this.tracer = tracer;
+            this.webClient = webClient;
         }
 
         // echo the request message
@@ -80,6 +91,18 @@ public class GrpcServerApplication {
         public void unaryRpc(SimpleRequest request, StreamObserver<SimpleResponse> responseObserver) {
             String message = request.getRequestMessage() + " from EchoService";
             SimpleResponse response = SimpleResponse.newBuilder().setResponseMessage(message).build();
+
+            webClient.get()
+                .uri("api/users")
+                .retrieve()
+                .bodyToMono(String.class)
+                .doOnNext(abc -> {
+                    log.info("Inside webclient thread.");
+                    log.info("<ACCEPTANCE_TEST_GRPC+REACTIVE_WEBCLIENT> <TRACE:{}> Hello from producer",
+                        this.tracer.currentSpan().context().traceId());
+                })
+                .block();
+
             responseObserver.onNext(response);
             // log it before onCompleted. The onCompleted triggers closing the span.
             log.info("<ACCEPTANCE_TEST> <TRACE:{}> Hello from producer", this.tracer.currentSpan().context().traceId());
