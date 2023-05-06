@@ -1,9 +1,18 @@
 package com.example.micrometer;
 
+import static reactor.netty.Metrics.*;
+import static reactor.netty.Metrics.REGISTRY;
+import static reactor.netty.resources.ConnectionProvider.DEFAULT_POOL_MAX_CONNECTIONS;
+
+import io.micrometer.common.lang.NonNull;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.observation.Observation;
 import io.micrometer.observation.ObservationRegistry;
 import io.micrometer.observation.contextpropagation.ObservationThreadLocalAccessor;
 import io.micrometer.tracing.Tracer;
+
+import java.net.SocketAddress;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -14,12 +23,17 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.ExchangeStrategies;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.resources.ConnectionPoolMetrics;
+import reactor.netty.resources.ConnectionProvider;
 
 @SpringBootApplication
 public class WebClientApplication implements CommandLineRunner {
@@ -47,6 +61,13 @@ public class WebClientApplication implements CommandLineRunner {
 @Configuration
 class Config {
 
+    private static final int DEFAULT_POOL_MAX_CONNECTIONS = 50;
+    private static final long DEFAULT_PENDING_POOL_ACQUIRE_TIMEOUT_MILLIS = 15000;
+    private static final int DEFAULT_PENDING_POOL_ACQUIRE_MAX_COUNT = 1500;
+    private static final long DEFAULT_MAX_IDLE_TIMEOUT_MILLIS = 300_000;
+    private static final Duration CONNECTION_MAX_IDLE_TIME_MS = Duration.ofMillis(120_000); // 2 mins
+    private static final Duration CONNECTION_MAX_LIFE_TIME_MS = Duration.ofMillis(180_000); // 3 mins
+
     // You must register WebClient as a bean!
     @Bean
     WebClient webClient(WebClient.Builder builder, @Value("${url:http://localhost:3000}") String url) {
@@ -54,10 +75,88 @@ class Config {
         final ExchangeStrategies strategies = ExchangeStrategies.builder()
             .codecs(codecs -> codecs.defaultCodecs().maxInMemorySize(size))
             .build();
-        return builder.baseUrl(url).exchangeStrategies(strategies).observationConvention(new SpotnanaWebClientClientRequestObservationConvention("abc")).build();
+
+        final var httpClient =
+            HttpClient.create(
+                    createConnectionProviderBuilder()
+                        .maxIdleTime(CONNECTION_MAX_IDLE_TIME_MS)
+                        .maxLifeTime(CONNECTION_MAX_LIFE_TIME_MS)
+                        .build())
+                .compress(true);
+
+        return builder.baseUrl(url).exchangeStrategies(strategies)
+            .clientConnector(new ReactorClientHttpConnector(httpClient))
+            .observationConvention(new SpotnanaWebClientClientRequestObservationConvention("abc")).build();
+    }
+
+    public ConnectionProvider.Builder createConnectionProviderBuilder() {
+        return ConnectionProvider.builder("clientName.getName()")
+            // Idle timeout is added to avoid the readAddress related connection issue that was observed
+            // multiple times. See: https://spotnana.atlassian.net/browse/ST-23027
+            .maxIdleTime(Duration.ofMillis(DEFAULT_MAX_IDLE_TIMEOUT_MILLIS))
+            .maxConnections(DEFAULT_POOL_MAX_CONNECTIONS)
+            .pendingAcquireTimeout(Duration.ofMillis(DEFAULT_PENDING_POOL_ACQUIRE_TIMEOUT_MILLIS))
+            .pendingAcquireMaxCount(DEFAULT_PENDING_POOL_ACQUIRE_MAX_COUNT)
+            .metrics(true, ConnectionProviderMeterRegistrar::new);
     }
 
 }
+
+/*
+ * Customizes and controls the metrics and tags emitted on the NettyConnectionPool.
+ */
+ class ConnectionProviderMeterRegistrar
+    implements ConnectionProvider.MeterRegistrar {
+    @Override
+    public void registerMetrics(
+        @NonNull final String poolName,
+        @NonNull final String id,
+        @NonNull final SocketAddress remoteAddress,
+        @NonNull final ConnectionPoolMetrics metrics) {
+        var tags =
+            new String[] {
+                "server_name",
+                reactor.netty.Metrics.formatSocketAddress(remoteAddress),
+                "CLIENT_NAME",
+                poolName
+            };
+
+        Gauge.builder(
+                CONNECTION_PROVIDER_PREFIX + TOTAL_CONNECTIONS,
+                metrics,
+                ConnectionPoolMetrics::allocatedSize)
+            .description("The number of all connections, active or idle.")
+            .tags(tags)
+            .register(REGISTRY);
+
+        Gauge.builder(
+                CONNECTION_PROVIDER_PREFIX + ACTIVE_CONNECTIONS,
+                metrics,
+                ConnectionPoolMetrics::acquiredSize)
+            .description(
+                "The number of the connections that have been successfully acquired and are in active"
+                    + " use")
+            .tags(tags)
+            .register(REGISTRY);
+
+        Gauge.builder(
+                CONNECTION_PROVIDER_PREFIX + IDLE_CONNECTIONS,
+                metrics,
+                ConnectionPoolMetrics::idleSize)
+            .description("The number of the idle connections")
+            .tags(tags)
+            .register(REGISTRY);
+
+        Gauge.builder(
+                CONNECTION_PROVIDER_PREFIX + PENDING_CONNECTIONS,
+                metrics,
+                ConnectionPoolMetrics::pendingAcquireSize)
+            .description("The number of the request, that are pending acquire a connection")
+            .tags(tags)
+            .register(REGISTRY);
+    }
+}
+
 
 @Service
 class WebClientService {
